@@ -5,10 +5,15 @@ import com.gauri.splitter.entity.*;
 import com.gauri.splitter.repository.*;
 import com.gauri.splitter.util.SplitCalculator;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
+import jakarta.persistence.criteria.Predicate;
+import jakarta.persistence.criteria.Root;
+import jakarta.persistence.criteria.Subquery;
+import org.springframework.data.domain.*;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -80,10 +85,54 @@ public class ExpenseService {
     }
 
     @Transactional(readOnly = true)
-    public List<ExpenseResponse> list(String email, Long groupId) {
-        requireMember(membersOf(groupId), email);
-        return expenseRepository.findByGroupIdOrderByExpenseDateDescIdDesc(groupId)
-                .stream().map(this::toResponse).toList();
+    public PageResponse<ExpenseResponse> search(String email, Long groupId,
+                                                LocalDate from, LocalDate to,
+                                                Long memberId, String category,
+                                                int page, int size) {
+        Map<Long, GroupMember> members = membersOf(groupId);
+        requireMember(members, email);
+
+        if (from != null && to != null && from.isAfter(to)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "'from' date must not be after 'to' date");
+        }
+        if (memberId != null && !members.containsKey(memberId)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "That user is not a member of this group");
+        }
+
+        Specification<Expense> spec = (root, query, cb) -> {
+            List<Predicate> p = new ArrayList<>();
+            p.add(cb.equal(root.get("group").get("id"), groupId));
+            if (from != null) p.add(cb.greaterThanOrEqualTo(root.<LocalDate>get("expenseDate"), from));
+            if (to != null) p.add(cb.lessThanOrEqualTo(root.<LocalDate>get("expenseDate"), to));
+            if (category != null && !category.isBlank()) {
+                p.add(cb.equal(cb.lower(root.get("category")), category.trim().toLowerCase()));
+            }
+            if (memberId != null) {
+                // involved = paid it OR has a share in it
+                Subquery<Long> sub = query.subquery(Long.class);
+                Root<ExpenseSplit> s = sub.from(ExpenseSplit.class);
+                sub.select(s.<Long>get("id")).where(
+                        cb.equal(s.get("expense").get("id"), root.get("id")),
+                        cb.equal(s.get("user").get("id"), memberId));
+                p.add(cb.or(cb.equal(root.get("paidBy").get("id"), memberId), cb.exists(sub)));
+            }
+            return cb.and(p.toArray(new Predicate[0]));
+        };
+
+        Pageable pageable = PageRequest.of(Math.max(page, 0), Math.min(Math.max(size, 1), 100),
+                Sort.by(Sort.Order.desc("expenseDate"), Sort.Order.desc("id")));
+        Page<Expense> result = expenseRepository.findAll(spec, pageable);
+
+        // Page first (ids only), then load details for just those rows.
+        // Fetching a collection and paginating in one query would page in memory.
+        List<Long> ids = result.getContent().stream().map(Expense::getId).toList();
+        Map<Long, Expense> byId = ids.isEmpty() ? Map.of()
+                : expenseRepository.findAllByIdIn(ids).stream()
+                .collect(Collectors.toMap(Expense::getId, Function.identity()));
+        List<ExpenseResponse> items = ids.stream().map(byId::get).map(this::toResponse).toList();
+
+        return new PageResponse<>(items, result.getNumber(), result.getSize(),
+                result.getTotalElements(), result.getTotalPages());
     }
 
     @Transactional(readOnly = true)

@@ -9,6 +9,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.server.ResponseStatusException;
+import com.gauri.splitter.entity.SettlementStatus;
 
 import java.math.BigDecimal;
 import java.util.*;
@@ -19,6 +20,7 @@ public class BalanceService {
 
     private final ExpenseRepository expenseRepository;
     private final GroupMemberRepository memberRepository;
+    private final SettlementRepository settlementRepository;
 
     @Transactional(readOnly = true)
     public GroupBalanceResponse getBalances(String email, Long groupId) {
@@ -52,6 +54,14 @@ public class BalanceService {
         List<BalanceResponse> balances = net.entrySet().stream()
                 .map(en -> new BalanceResponse(en.getKey(), names.get(en.getKey()), en.getValue()))
                 .toList();
+
+        // Confirmed payments: the payer owes less, the receiver is owed less
+        for (Settlement st : settlementRepository.findByGroupIdWithUsers(groupId)) {
+            if (st.getStatus() == SettlementStatus.PAID) {
+                net.merge(st.getFromUser().getId(), st.getAmount(), BigDecimal::add);
+                net.merge(st.getToUser().getId(), st.getAmount().negate(), BigDecimal::add);
+            }
+        }
 
         return new GroupBalanceResponse(balances, settlements);
     }
